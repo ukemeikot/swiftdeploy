@@ -1,0 +1,10 @@
+.git
+.gitignore
+.venv
+.tmp
+.pip-cache
+__pycache__
+*.pyc
+docker-compose.yml
+nginx.conf
+README.md

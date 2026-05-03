@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "swiftdeploy-cli"
+version = "1.0.0"
+description = "Declarative deployment lifecycle CLI for the SwiftDeploy Stage 4A task"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "Jinja2==3.1.4",
+    "PyYAML==6.0.2",
+]
+
+[project.scripts]
+swiftdeploy = "swiftdeploy_cli.core:main"
+
+[tool.setuptools.packages.find]
+include = ["swiftdeploy_cli*"]

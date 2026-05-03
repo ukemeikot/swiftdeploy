@@ -1,0 +1,51 @@
+services:
+  api:
+    image: {{ service.image }}
+    container_name: {{ service.container_name }}
+    restart: {{ service.restart_policy }}
+    user: "10001:10001"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      MODE: {{ service.mode }}
+      APP_VERSION: "{{ service.version }}"
+      APP_PORT: "{{ service.port }}"
+    expose:
+      - "{{ service.port }}"
+    networks:
+      - {{ network.name }}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:{{ service.port }}/healthz', timeout=2).read()"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  nginx:
+    image: {{ nginx.image }}
+    container_name: {{ nginx.container_name }}
+    restart: {{ service.restart_policy }}
+    user: "101:101"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "{{ nginx.port }}:8080"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - nginx-logs:/var/log/nginx
+    networks:
+      - {{ network.name }}
+
+networks:
+  {{ network.name }}:
+    driver: {{ network.driver_type }}
+
+volumes:
+  nginx-logs:
