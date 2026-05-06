@@ -1,9 +1,20 @@
 $ErrorActionPreference = "Stop"
 
-python -m pip uninstall -y swiftdeploy-cli
+$PyLauncher = Get-Command py -ErrorAction SilentlyContinue
+if ($PyLauncher) {
+    $PyCommand = @("py", "-3")
+} else {
+    $PyCommand = @("python")
+}
 
-$PythonVersion = python -c "import sys; print(f'Python{sys.version_info.major}{sys.version_info.minor}')"
-$UserScripts = Join-Path $env:APPDATA "Python\$PythonVersion\Scripts"
+# Capture the Scripts dir BEFORE uninstalling, so we can clean PATH afterwards.
+$UserScripts = & $PyCommand[0] $PyCommand[1..($PyCommand.Length - 1)] -c "import sysconfig; print(sysconfig.get_path('scripts'))"
+
+& $PyCommand[0] $PyCommand[1..($PyCommand.Length - 1)] -m pip uninstall -y swiftdeploy-cli
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "WARNING: pip uninstall failed (exit $LASTEXITCODE). Continuing with PATH cleanup." -ForegroundColor Yellow
+}
+
 $CurrentUserPath = [Environment]::GetEnvironmentVariable("Path", "User")
 $RemainingPath = (($CurrentUserPath -split ";") | Where-Object { $_ -and $_ -ne $UserScripts }) -join ";"
 

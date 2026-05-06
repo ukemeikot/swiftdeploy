@@ -1,7 +1,7 @@
 services:
   image: swift-deploy-1-node:latest
   port: 3000
-  mode: stable
+  mode: canary
   version: 1.0.0
   restart_policy: unless-stopped
   container_name: swiftdeploy-api
@@ -14,3 +14,22 @@ nginx:
 network:
   name: swiftdeploy-net
   driver_type: bridge
+opa:
+  image: openpolicyagent/opa:1.16.1-static
+  port: 8181
+  container_name: swiftdeploy-opa
+  policy_network: swiftdeploy-policy-net
+policies:
+  infrastructure:
+    min_disk_free_gb: 10
+    max_cpu_load: 2.0
+    max_mem_used_pct: 0.9
+    disk_path: /
+  canary_safety:
+    max_error_rate: 0.01
+    max_p99_latency_ms: 500
+    window_seconds: 30
+    min_sample_requests: 5
+audit:
+  history_path: history.jsonl
+  report_path: audit_report.md

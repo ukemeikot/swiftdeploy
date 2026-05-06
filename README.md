@@ -1,10 +1,10 @@
 # SwiftDeploy
 
-> A declarative CLI that builds, runs, validates, and promotes a containerised web stack from a single YAML manifest.
+> A declarative CLI that builds, runs, validates, promotes, and **policy-gates** a containerised web stack from a single YAML manifest.
 
-SwiftDeploy is the answer to a simple question: **what if the only file you had to write to deploy an app was a description of what you wanted?** No hand-edited Compose files. No copy-pasted Nginx snippets. You write a manifest, and the CLI generates everything else.
+SwiftDeploy is the answer to a simple question: **what if the only file you had to write to deploy an app was a description of what you wanted?** No hand-edited Compose files. No copy-pasted Nginx snippets. The CLI templates everything else and refuses to deploy or promote when policy says no.
 
-This is the HNG DevOps Stage 4A submission. It's small enough to read end-to-end in an afternoon and beginner-friendly enough that you can clone it, run two commands, and have a working reverse-proxied API on your laptop.
+This is the HNG DevOps Stage 4 submission (parts **A** and **B**). Stage 4A built the engine — manifest → templates → lifecycle. Stage 4B added the **eyes** (`/metrics` + a live status dashboard), the **brain** (an OPA sidecar that owns every allow/deny call), and the **memory** (`history.jsonl` + `audit_report.md`).
 
 ---
 
@@ -20,11 +20,13 @@ This is the HNG DevOps Stage 4A submission. It's small enough to read end-to-end
 8. [The manifest explained](#the-manifest-explained)
 9. [The CLI subcommands](#the-cli-subcommands)
 10. [The API service](#the-api-service)
-11. [Architecture & design choices](#architecture--design-choices)
-12. [End-to-end walkthrough](#end-to-end-walkthrough)
-13. [Viewing logs](#viewing-logs)
-14. [Troubleshooting](#troubleshooting)
-15. [What you can edit vs. what's generated](#what-you-can-edit-vs-whats-generated)
+11. [Observability & metrics](#observability--metrics)
+12. [Policy gates with OPA](#policy-gates-with-opa)
+13. [Architecture & design choices](#architecture--design-choices)
+14. [End-to-end walkthrough](#end-to-end-walkthrough)
+15. [Viewing logs](#viewing-logs)
+16. [Troubleshooting](#troubleshooting)
+17. [What you can edit vs. what's generated](#what-you-can-edit-vs-whats-generated)
 
 ---
 
@@ -75,40 +77,44 @@ You can promote between **stable** and **canary** modes with one command, run a 
           ┌────────────────────────┐
           │       swiftdeploy      │   the CLI (Python)
           └───────────┬────────────┘
-                      │ Jinja2 renders
-                      │ templates with
-                      │ values from manifest
-        ┌─────────────┼─────────────┐
-        ▼                           ▼
-  docker-compose.yml          nginx.conf
-        │                           │
-        │   docker compose up       │   mounted into the nginx container
-        ▼                           ▼
-  ┌──────────────┐            ┌──────────────┐
-  │ swiftdeploy- │  upstream  │ swiftdeploy- │
-  │     api      │◄───────────│    nginx     │◄──── localhost:8080
-  │ (Flask app)  │   :3000    │ (reverse     │
-  │              │            │  proxy)      │
-  └──────────────┘            └──────────────┘
-        │                           │
-        └────── docker network ─────┘
-              (swiftdeploy-net)
+                      │ Jinja2 + JSON renders
+                      ▼
+   ┌────────────────────┬────────────────────────┐
+   ▼                    ▼                        ▼
+docker-compose.yml   nginx.conf       generated/opa-data.json
+   │                    │                        │
+   │  docker compose up │     mounted into       │  mounted into
+   ▼                    ▼     nginx container    ▼     opa container
+                                       ┌────────────────┐
+ ┌──────────────┐    ┌──────────────┐  │ swiftdeploy-   │
+ │ swiftdeploy- │ ←──│ swiftdeploy- │  │     opa        │
+ │     api      │    │    nginx     │  │ (policy engine)│◄── 127.0.0.1:8181
+ │ (Flask)      │    │ (proxy)      │  └────────────────┘    (host-only)
+ └──────────────┘    └──────────────┘            ▲
+        │                    │                   │ POST /v1/data/<domain>/decision
+        └─── public-net ─────┘                   │
+                            │                    │
+                            └─── policy-net ─────┘
+                                  (internal)
+                                  ▲
+                              localhost:8080  ◄── users
 ```
 
-**Key idea:** `docker-compose.yml` and `nginx.conf` are _derived artifacts_. They are deleted and regenerated on every `swiftdeploy init`. If you find yourself editing them directly, stop — change the manifest or the template instead.
+**Key idea:** every generated file is a *derived artifact*. The CLI deletes and regenerates them on every `swiftdeploy init`. If you find yourself editing them directly, stop — change the manifest or the template instead. **All allow/deny decisions are made by OPA, never by Python.**
 
 ---
 
 ## The stack at a glance
 
-| Layer           | Tech                                     |
-| --------------- | ---------------------------------------- |
-| API service     | Python 3.12 + Flask + gunicorn           |
-| Reverse proxy   | Custom Nginx image (`FROM nginx:latest`) |
-| Orchestration   | Docker + Docker Compose v2               |
-| Templating      | Jinja2                                   |
-| CLI             | Python 3.10+ (argparse, urllib, PyYAML)  |
-| Manifest format | YAML                                     |
+| Layer           | Tech                                                       |
+| --------------- | ---------------------------------------------------------- |
+| API service     | Python 3.12 + Flask + gunicorn + prometheus-client         |
+| Reverse proxy   | Custom Nginx image (`FROM nginx:latest`)                   |
+| Policy engine   | Open Policy Agent (`openpolicyagent/opa:1.16.1-static`)  |
+| Orchestration   | Docker + Docker Compose v2 (two networks: public + policy) |
+| Templating      | Jinja2 (configs) + JSON (OPA data)                         |
+| CLI             | Python 3.10+ (argparse, urllib, PyYAML, psutil, rich)      |
+| Manifest format | YAML                                                       |
 
 ---
 
@@ -117,33 +123,43 @@ You can promote between **stable** and **canary** modes with one command, run a 
 ```
 .
 ├── app/                       <- Flask API source
-│   ├── main.py                   the /, /healthz, /chaos endpoints
+│   ├── main.py                   /, /healthz, /chaos, /metrics
 │   └── requirements.txt
-├── templates/                 <- Jinja2 templates (rendered by the CLI)
+├── templates/                 <- Jinja2 templates (rendered by init)
 │   ├── docker-compose.yml.j2
 │   └── nginx.conf.j2
+├── policies/                  <- Rego policies (loaded into OPA)
+│   ├── infrastructure.rego       pre-deploy gate (disk/CPU/mem)
+│   └── canary_safety.rego        pre-promote gate (error rate, p99)
 ├── swiftdeploy_cli/           <- the CLI package
-│   ├── __init__.py
-│   └── core.py                   all subcommand logic lives here
+│   ├── core.py                   subcommands + lifecycle
+│   ├── opa.py                    OPA HTTP client + decision dataclass
+│   ├── host_stats.py             pre-deploy host readings (psutil)
+│   ├── metrics.py                /metrics scrape + windowed stats
+│   ├── history.py                append-only audit log
+│   ├── dashboard.py              live `swiftdeploy status` view
+│   └── audit.py                  `audit_report.md` renderer
 ├── scripts/                   <- Windows installer / uninstaller helpers
 ├── Dockerfile                 <- builds the API image
-├── nginx.Dockerfile           <- builds a non-root nginx image
+├── nginx.Dockerfile           <- builds the non-root nginx image
 ├── manifest.yaml              <- the only deployment file you edit by hand
 ├── pyproject.toml             <- packages the CLI as `swiftdeploy`
-├── requirements.txt           <- runtime deps for the CLI
-├── swiftdeploy                <- shebang-style launcher (Linux/macOS)
+├── requirements.txt
+├── swiftdeploy                <- launcher (Linux/macOS)
 ├── swiftdeploy.cmd            <- launcher (Windows)
+├── TEST.md                    <- full test plan (see file)
 └── README.md
 ```
 
-These two files are **generated**, not committed:
+These files are **generated** at runtime, not committed:
 
 ```
-docker-compose.yml
-nginx.conf
+docker-compose.yml      ← swiftdeploy init
+nginx.conf              ← swiftdeploy init
+generated/opa-data.json ← swiftdeploy init  (OPA's data document)
+history.jsonl           ← swiftdeploy status / deploy / promote
+audit_report.md         ← swiftdeploy audit
 ```
-
-`swiftdeploy init` writes them. `swiftdeploy teardown --clean` deletes them. They're gitignored.
 
 ---
 
@@ -246,7 +262,7 @@ Both at once is impossible with the stock image. Our `nginx.Dockerfile` is a fou
 Verify the images are present and small enough:
 
 ```bash
-docker image ls swift-deploy-1-node swiftdeploy-nginx
+docker image ls --filter "reference=swift-deploy-1-node" --filter "reference=swiftdeploy-nginx"
 ```
 
 Both should be well under 300 MB.
@@ -278,7 +294,35 @@ network:
   driver_type: bridge # the docker network driver
 ```
 
-**Required fields** (`swiftdeploy validate` will fail if any are missing or empty): `services.image`, `services.port`, `nginx.image`, `nginx.port`, `network.name`, `network.driver_type`. `services.mode` must be either `stable` or `canary`.
+**Required fields** (`swiftdeploy validate` will fail if any are missing or empty): `services.image`, `services.port`, `nginx.image`, `nginx.port`, `network.name`, `network.driver_type`, `opa.image`, `opa.port`, `policies.infrastructure`, `policies.canary_safety`. `services.mode` must be either `stable` or `canary`.
+
+### Stage 4B additions
+
+```yaml
+opa:
+  image: openpolicyagent/opa:1.16.1-static # pinned for reproducibility
+  port: 8181 # bound to 127.0.0.1 only — never exposed publicly
+  container_name: swiftdeploy-opa
+  policy_network: swiftdeploy-policy-net # internal docker network
+
+policies:
+  infrastructure: # pre-deploy gate
+    min_disk_free_gb: 10
+    max_cpu_load: 2.0
+    max_mem_used_pct: 0.90
+    disk_path: /
+  canary_safety: # pre-promote gate
+    max_error_rate: 0.01 # 1%
+    max_p99_latency_ms: 500
+    window_seconds: 30
+    min_sample_requests: 5
+
+audit:
+  history_path: history.jsonl
+  report_path: audit_report.md
+```
+
+Threshold values live **only** in the manifest. They are rendered to `generated/opa-data.json` by `swiftdeploy init` and loaded by OPA as `data.thresholds.*`. Rego files reference them — they never hardcode numbers.
 
 ---
 
@@ -290,7 +334,7 @@ swiftdeploy <command> [options]
 
 ### `init`
 
-Renders the templates against the current manifest and writes `docker-compose.yml` and `nginx.conf` to the project root. Idempotent — running it twice is the same as running it once.
+Renders templates and the OPA data file against the current manifest, writing `docker-compose.yml`, `nginx.conf`, and `generated/opa-data.json` to the project root. Idempotent — running it twice is the same as running it once.
 
 ```bash
 swiftdeploy init
@@ -318,40 +362,79 @@ Each check prints a `PASS` or `FAIL` line. Exit code is 0 if all pass, 1 otherwi
 
 ### `deploy`
 
-Runs `init`, brings the stack up with `docker compose up -d`, and **blocks** until `GET /healthz` returns 200 (or 60 seconds elapse, whichever comes first).
+Runs `init`, brings up **OPA first**, runs the **infrastructure pre-deploy gate** (host disk / CPU / memory readings → OPA), and only on `allow` brings up the rest of the stack and blocks until `GET /healthz` returns 200 (or 60 seconds elapse).
 
 ```bash
-swiftdeploy deploy
+swiftdeploy deploy            # gated
+swiftdeploy deploy --force    # bypass denials, recorded in history.jsonl
 ```
 
-If the health check times out, the command exits with a non-zero status and prints the last error it saw.
+| Outcome                   | Exit code | What you see                                                |
+| ------------------------- | --------- | ----------------------------------------------------------- |
+| Allowed and healthy       | 0         | `[infrastructure] ALLOW` then `Deployment is healthy`       |
+| Denied by policy          | 2         | `[infrastructure] DENY` with rule, observed value, threshold |
+| OPA unreachable           | 1         | `policy engine offline (no container?)`                     |
+| OPA timeout               | 1         | `policy engine timeout: ...`                                |
+| OPA bad/malformed reply   | 1         | `policy '<x>' returned a malformed decision (no 'allow')`   |
+| Health check timeout      | 1         | `health checks did not pass within 60s`                     |
 
 ### `promote`
 
 Switches the API between `stable` and `canary` mode without touching Nginx.
 
 ```bash
-swiftdeploy promote canary
-swiftdeploy promote stable
+swiftdeploy promote canary    # gated by canary_safety
+swiftdeploy promote stable    # always allowed (rollback path)
+swiftdeploy promote canary --force   # bypass denial, recorded
 ```
 
 In one command, `promote`:
 
-1. Updates `services.mode` in `manifest.yaml` in place.
-2. Regenerates `docker-compose.yml` so the container's `MODE` env var matches.
-3. Restarts **only** the API container (`docker compose up -d --no-deps --force-recreate api`).
-4. Polls `/healthz` until it sees the new mode (or until 60 seconds elapse).
+1. **(canary only)** Scrapes `/metrics` twice with a `policies.canary_safety.window_seconds` gap, computes error rate / p99 / sample count, and queries OPA's `canary_safety` policy. On deny, exits 2.
+2. Updates `services.mode` in `manifest.yaml` in place.
+3. Regenerates `docker-compose.yml` so the container's `MODE` env var matches.
+4. Restarts **only** the API container (`docker compose up -d --no-deps --force-recreate api`).
+5. Polls `/healthz` until it sees the new mode (or until 60 seconds elapse).
 
-Nginx and the named volume are untouched, so existing access logs aren't lost.
+`promote stable` skips the gate entirely so a failing canary can always be rolled back. Nginx and the named volume are untouched.
 
 ### `teardown`
 
-Removes all containers, the named volume, and the network created by `docker compose`.
+Removes all containers, both networks, and the named volume created by `docker compose`.
 
 ```bash
 swiftdeploy teardown            # remove the stack
-swiftdeploy teardown --clean    # also delete the generated docker-compose.yml and nginx.conf
+swiftdeploy teardown --clean    # also delete generated docker-compose.yml, nginx.conf, generated/opa-data.json
 ```
+
+### `status`
+
+Live terminal dashboard. Scrapes `/metrics` and queries OPA every `--interval` seconds (default 2s), and **appends every scrape to `history.jsonl`** as the audit trail. Ctrl-C to exit.
+
+```bash
+swiftdeploy status
+swiftdeploy status --interval 1
+```
+
+The dashboard shows two panels:
+
+- **Live metrics** — current mode, active chaos, uptime, req/s, error rate, p99 latency, sample count.
+- **Policy compliance** — per-domain `PASS`/`FAIL` rows with rule names and reasons.
+
+### `audit`
+
+Reads `history.jsonl` and writes a GitHub-Flavored Markdown report.
+
+```bash
+swiftdeploy audit
+swiftdeploy audit --output reports/run-2026-05-06.md
+```
+
+The report has three sections:
+
+- **Timeline** — consecutive same-state scrapes collapsed into rows of `(start, end, mode + chaos)`.
+- **Policy violations** — every denial recorded during the run.
+- **Forced overrides** — any time `--force` was used (with command and reason).
 
 ---
 
@@ -395,6 +478,105 @@ curl -X POST http://localhost:8080/chaos \
 
 > **PowerShell tip:** when sending JSON via `curl.exe` on Windows, escape the inner quotes:
 > `-d '{\"mode\":\"recover\"}'`
+
+---
+
+## Observability & metrics
+
+The Flask app exposes Prometheus metrics at `GET /metrics` (text format `0.0.4`). Every request is wrapped in `before_request` / `after_request` middleware that records:
+
+| Metric                              | Type      | Labels                       | What it tracks                       |
+| ----------------------------------- | --------- | ---------------------------- | ------------------------------------ |
+| `http_requests_total`               | Counter   | `method`, `path`, `status_code` | Throughput and per-status counts     |
+| `http_request_duration_seconds`     | Histogram | `method`, `path`             | Latency, default Prometheus buckets  |
+| `app_uptime_seconds`                | Gauge     | —                            | Process uptime in seconds            |
+| `app_mode`                          | Gauge     | —                            | `0` = stable, `1` = canary           |
+| `chaos_active`                      | Gauge     | —                            | `0` = none, `1` = slow, `2` = error  |
+
+`/metrics` and `/healthz` are excluded from the request counter so scrape volume doesn't drown the canary-safety window.
+
+```bash
+curl http://localhost:8080/metrics | grep -E '^(http_|app_|chaos_)'
+```
+
+The CLI scrapes this same endpoint to compute windowed stats for `swiftdeploy status` and `swiftdeploy promote canary` (the canary gate). Histograms are cumulative — windowed p99/error rate is computed from a delta between two snapshots taken `policies.canary_safety.window_seconds` apart.
+
+---
+
+## Policy gates with OPA
+
+SwiftDeploy ships with an Open Policy Agent sidecar. **The CLI never decides allow/deny on its own** — it ships an input document to OPA, OPA evaluates the relevant policy package, and the CLI surfaces the decision and (on deny) blocks the lifecycle action. This gives you:
+
+- **Auditability** — every decision is a structured object with a `rule`, a `message`, an `observed` value, and a `threshold`. No bare booleans.
+- **Hot-reloadable rules** — OPA reloads `policies/` automatically. Edit a `.rego` file, save, and the next gate query uses the new logic without restarting anything.
+- **Domain isolation** — each policy package owns one question. `infrastructure` answers "is this host safe to deploy onto?". `canary_safety` answers "is this canary healthy enough to promote?". Changing one never touches the other.
+
+### How a gate query works
+
+```
+swiftdeploy deploy
+   │
+   ├─ scrape host stats (psutil)         ← input.host = {disk_free_gb, cpu_load_1m, mem_used_pct}
+   ├─ POST http://127.0.0.1:8181/v1/data/infrastructure/decision
+   │      with {"input": {...}}
+   │
+   ├─ OPA loads /policies/*.rego + /data/opa-data.json
+   ├─ evaluates `data.infrastructure.decision`
+   └─ returns {"result": {"allow": false, "violations": [...], "domain": "infrastructure"}}
+   │
+   └─ on allow → docker compose up -d → /healthz → done
+      on deny  → render violations → exit 2 (deploy did NOT happen)
+```
+
+### The two policies shipped
+
+| File | Package | Asks | Inputs | Thresholds (from manifest) |
+| ---- | ------- | ---- | ------ | --------------------------- |
+| `policies/infrastructure.rego` | `infrastructure` | "Is the host safe to deploy onto?" | `host.{disk_free_gb, cpu_load_1m, mem_used_pct}` | `min_disk_free_gb`, `max_cpu_load`, `max_mem_used_pct` |
+| `policies/canary_safety.rego` | `canary_safety` | "Is the canary healthy enough to promote?" | `metrics.{error_rate, p99_latency_ms, sample_requests}`, `target_mode` | `max_error_rate`, `max_p99_latency_ms`, `min_sample_requests`, `window_seconds` |
+
+### Where the thresholds come from
+
+`generated/opa-data.json` is rendered by `swiftdeploy init` from `manifest.yaml`:
+
+```json
+{
+  "thresholds": {
+    "infrastructure": { "min_disk_free_gb": 10, "max_cpu_load": 2.0, "max_mem_used_pct": 0.9, "disk_path": "/" },
+    "canary_safety":  { "max_error_rate": 0.01, "max_p99_latency_ms": 500, "window_seconds": 30, "min_sample_requests": 5 }
+  }
+}
+```
+
+Inside Rego, every threshold is read with `data.thresholds.<domain>.<field>`. There are **no numeric literals** in `.rego` files — change a number in the manifest, re-run `swiftdeploy init`, and OPA picks up the new value on its next reload.
+
+### Network isolation
+
+OPA runs on a **separate** Docker network (`policy-net`); nginx is only on `public-net`. Since nginx cannot route to a container it shares no network with, OPA is unreachable through the public ingress regardless of any flag. The OPA port is also host-bound to `127.0.0.1:8181` only — never `0.0.0.0` — so the CLI on the host can reach it but nothing on a remote machine can. Two consequences worth checking yourself:
+
+```bash
+# OPA reachable from the host (CLI uses this)
+curl http://127.0.0.1:8181/health   # → 200 OK
+
+# OPA NOT reachable through nginx (the public ingress)
+curl http://localhost:8080/v1/data/infrastructure/decision   # → 404 Not Found
+```
+
+If those don't behave as above, the topology is broken and the "no leakage" submission requirement is failing.
+
+### Failure handling
+
+The CLI distinguishes every OPA failure mode and prints a different message — never a stack trace:
+
+| Failure                       | Message                                                       |
+| ----------------------------- | ------------------------------------------------------------- |
+| Container not running         | `policy engine offline (no container?). Start the stack first or pass --force.` |
+| Connection timeout            | `policy engine timeout: ... after 3s`                          |
+| HTTP 5xx from OPA             | `policy engine unhealthy: ...`                                |
+| Rego compile or runtime error | `policy '<x>' returned a malformed decision...`               |
+| Non-JSON response             | `policy engine returned an unparseable body...`               |
+
+`--force` (on `deploy` and `promote`) lets an operator bypass the gate in an emergency. Every override is appended to `history.jsonl` with the reason for the audit trail.
 
 ---
 
@@ -527,14 +709,55 @@ Each line should look like:
 2026-05-03T12:14:02+00:00 | 200 | 0.004s | 172.18.0.2:3000 | GET /healthz HTTP/1.1
 ```
 
-### 9. Tear it all down
+### 9. Watch the live dashboard during chaos
+
+In one terminal:
 
 ```bash
-swiftdeploy teardown            # stop containers, remove volume + network
+swiftdeploy promote canary
+swiftdeploy status
+```
+
+In a second terminal, induce errors:
+
+```bash
+curl -X POST http://localhost:8080/chaos -H "Content-Type: application/json" \
+  -d '{"mode":"error","rate":0.5}'
+
+# Generate load
+for i in $(seq 1 200); do curl -s -o /dev/null http://localhost:8080/; done
+```
+
+Watch the dashboard's `error rate` and `chaos_active` rows climb in real time. Then try to promote back to canary — wait, you're already canary. Try the **inverse** — recover, then attempt to promote canary→canary again with chaos still injected:
+
+```bash
+# In terminal #2, try to promote while error rate is high (use a fresh attempt while chaos is still active):
+swiftdeploy promote canary       # → DENY: max_error_rate
+```
+
+`promote stable` will always succeed (rollback path):
+
+```bash
+swiftdeploy promote stable
+```
+
+### 10. Render the audit report
+
+```bash
+swiftdeploy audit
+cat audit_report.md
+```
+
+You should see a Timeline table covering the run, a Violations table for any policy denials, and a Forced overrides section if you used `--force` anywhere.
+
+### 11. Tear it all down
+
+```bash
+swiftdeploy teardown            # stop containers, remove volumes + networks
 swiftdeploy teardown --clean    # also delete the generated configs
 ```
 
-The grader's flow is essentially this sequence — start fresh, build, validate, deploy, promote, teardown.
+The grader's flow is essentially this sequence — start fresh, build, validate, deploy (gated), promote (gated), exercise chaos, audit, teardown.
 
 ---
 
@@ -627,8 +850,19 @@ If the generated config doesn't match what you want, fix the **manifest** or the
 
 ---
 
-## Submission notes (HNG Stage 4A)
+## Submission notes (HNG Stage 4)
+
+**Stage 4A**
 
 - Public GitHub repo: includes `manifest.yaml`, `swiftdeploy`, `app/`, `templates/`, `Dockerfile`, `nginx.Dockerfile`, `README.md`.
 - Screenshots in Google Drive: `validate` output, `deploy` output, `promote` + `/healthz` confirmation, generated `nginx.conf` and `docker-compose.yml`, and the Nginx access log output.
 - Generated files (`docker-compose.yml`, `nginx.conf`) are gitignored. The grader regenerates them with `swiftdeploy init`.
+
+**Stage 4B**
+
+- Adds: `policies/`, `swiftdeploy_cli/{opa,host_stats,metrics,history,dashboard,audit}.py`, OPA service in compose template, `policies` and `opa` blocks in manifest.
+- Hard gate: filling host disk causes `swiftdeploy deploy` to refuse with `[infrastructure] DENY — min_disk_free_gb: ...` and exit code 2.
+- No leakage: OPA's `:8181` is bound to `127.0.0.1` only, sits on `policy-net` (`internal: true`), and is unreachable through the public nginx port.
+- Audit: `history.jsonl` is appended on every gate query, scrape, decision, and force-override; `swiftdeploy audit` renders it as GFM `audit_report.md`.
+- Blog post: see [BLOG.md placeholder] — published walkthrough with architecture diagram, OPA rationale, chaos demo, and lessons learned.
+- See [TEST.md](TEST.md) for the full installation + test plan.

@@ -3,7 +3,15 @@ import random
 import time
 from datetime import datetime, timezone
 
-from flask import Flask, jsonify, request
+from flask import Flask, Response, jsonify, request
+from prometheus_client import (
+    CONTENT_TYPE_LATEST,
+    CollectorRegistry,
+    Counter,
+    Gauge,
+    Histogram,
+    generate_latest,
+)
 
 
 app = Flask(__name__)
@@ -15,6 +23,50 @@ CHAOS = {
     "rate": 0,
 }
 
+REGISTRY = CollectorRegistry()
+
+REQUESTS_TOTAL = Counter(
+    "http_requests_total",
+    "Total HTTP requests by method, path, and status code",
+    ["method", "path", "status_code"],
+    registry=REGISTRY,
+)
+
+REQUEST_DURATION = Histogram(
+    "http_request_duration_seconds",
+    "HTTP request latency in seconds",
+    ["method", "path"],
+    registry=REGISTRY,
+)
+
+UPTIME_GAUGE = Gauge(
+    "app_uptime_seconds",
+    "Process uptime in seconds",
+    registry=REGISTRY,
+)
+
+MODE_GAUGE = Gauge(
+    "app_mode",
+    "Deployment mode (0=stable, 1=canary)",
+    registry=REGISTRY,
+)
+
+CHAOS_GAUGE = Gauge(
+    "chaos_active",
+    "Active chaos injection (0=none, 1=slow, 2=error)",
+    registry=REGISTRY,
+)
+
+CHAOS_CODES = {None: 0, "slow": 1, "error": 2}
+
+# Routes excluded from request counting/latency to avoid scraper-induced noise.
+EXCLUDED_PATHS = {"/metrics", "/healthz"}
+
+# Routes never affected by chaos. /metrics and /healthz are infrastructure
+# endpoints — gating them on chaos would break the gate's ability to read
+# real signal during a degraded canary.
+CHAOS_EXEMPT_PATHS = {"/metrics", "/healthz", "/chaos"}
+
 
 def app_mode():
     return os.getenv("MODE", "stable").strip().lower() or "stable"
@@ -22,6 +74,12 @@ def app_mode():
 
 def app_version():
     return os.getenv("APP_VERSION", "1.0.0")
+
+
+def refresh_state_gauges():
+    UPTIME_GAUGE.set(time.monotonic() - STARTED_AT)
+    MODE_GAUGE.set(1 if app_mode() == "canary" else 0)
+    CHAOS_GAUGE.set(CHAOS_CODES.get(CHAOS["mode"], 0))
 
 
 def apply_chaos():
@@ -42,18 +100,31 @@ def apply_chaos():
     return None
 
 
-@app.after_request
-def add_mode_header(response):
-    if app_mode() == "canary":
-        response.headers["X-Mode"] = "canary"
-    return response
-
-
 @app.before_request
 def before_each_request():
-    if request.path == "/chaos":
+    request._start_time = time.perf_counter()
+    if request.path in CHAOS_EXEMPT_PATHS:
         return None
     return apply_chaos()
+
+
+@app.after_request
+def after_each_request(response):
+    if app_mode() == "canary":
+        response.headers["X-Mode"] = "canary"
+
+    path = request.path or "/"
+    if path not in EXCLUDED_PATHS:
+        start = getattr(request, "_start_time", None)
+        if start is not None:
+            REQUEST_DURATION.labels(method=request.method, path=path).observe(
+                time.perf_counter() - start
+            )
+        REQUESTS_TOTAL.labels(
+            method=request.method, path=path, status_code=str(response.status_code)
+        ).inc()
+
+    return response
 
 
 @app.get("/")
@@ -68,12 +139,19 @@ def index():
 
 @app.get("/healthz")
 def healthz():
+    refresh_state_gauges()
     return jsonify({
         "status": "ok",
         "mode": app_mode(),
         "version": app_version(),
         "uptime": round(time.monotonic() - STARTED_AT, 3),
     })
+
+
+@app.get("/metrics")
+def metrics():
+    refresh_state_gauges()
+    return Response(generate_latest(REGISTRY), mimetype=CONTENT_TYPE_LATEST)
 
 
 @app.post("/chaos")
@@ -105,6 +183,7 @@ def chaos():
     else:
         return jsonify({"error": "mode must be slow, error, or recover"}), 400
 
+    refresh_state_gauges()
     return jsonify({
         "status": "ok",
         "chaos": CHAOS,

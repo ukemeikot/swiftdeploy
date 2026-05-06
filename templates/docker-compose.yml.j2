@@ -43,9 +43,43 @@ services:
     networks:
       - {{ network.name }}
 
+  opa:
+    image: {{ opa.image }}
+    container_name: {{ opa.container_name }}
+    restart: {{ service.restart_policy }}
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    command:
+      - "run"
+      - "--server"
+      - "--addr=0.0.0.0:8181"
+      - "--log-level=error"
+      - "/policies"
+      - "/data/opa-data.json"
+    volumes:
+      - ./policies:/policies:ro
+      - ./generated:/data:ro
+    ports:
+      - "127.0.0.1:{{ opa.port }}:8181"
+    networks:
+      - {{ opa.policy_network }}
+    healthcheck:
+      test: ["CMD", "/opa", "version"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 3s
+
 networks:
   {{ network.name }}:
+    name: {{ network.name }}
+    driver: {{ network.driver_type }}
+  {{ opa.policy_network }}:
+    name: {{ opa.policy_network }}
     driver: {{ network.driver_type }}
 
 volumes:
   nginx-logs:
+    name: swiftdeploy-nginx-logs
